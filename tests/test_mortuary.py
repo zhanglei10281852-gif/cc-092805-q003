@@ -55,6 +55,124 @@ def test_burial_right_normal_renewal(client):
     assert right.status_code == 201
     renewed = client.post(f"/api/mortuary/burial-rights/{right.json()['id']}/renew", json={"years": 5, "handled_by": "cemetery-clerk", "payment_reference": "RIGHT-PAY-001"})
     assert renewed.status_code == 200 and renewed.json()["expires_on"] == "2050-01-01"
+    record = renewed.json()["latest_renewal"]
+    assert record["previous_expires_on"] == "2045-01-01"
+    assert record["new_expires_on"] == "2050-01-01"
+    assert (record["previous_version"], record["new_version"]) == (1, 2)
+    assert renewed.json()["version"] == 2
+
+
+def _make_right(client, plot: str, expires_on: str) -> dict:
+    response = client.post("/api/mortuary/burial-rights?actor=cemetery-clerk", json={"plot_code": plot, "holder_name": "权属人", "holder_identity": f"ID-{plot}", "starts_on": "2005-01-01", "expires_on": expires_on, "case_id": None})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _renew(client, right_id: int, reference: str, years: int = 1, handled_by: str = "cemetery-clerk"):
+    return client.post(f"/api/mortuary/burial-rights/{right_id}/renew", json={"years": years, "handled_by": handled_by, "payment_reference": reference})
+
+
+def test_leap_day_renewal_does_not_500_and_uses_feb28_rule(client):
+    # 核心事故场景：2 月 29 日到期，普通年份续期过去直接 500
+    right = _make_right(client, "A-02-029", "2024-02-29")
+    first = _renew(client, right["id"], "LEAP-PAY-001")
+    assert first.status_code == 200, first.text
+    assert first.json()["expires_on"] == "2025-02-28"
+    # 续期链条在 2 月 28 日对上继续顺延
+    second = _renew(client, right["id"], "LEAP-PAY-002")
+    assert second.status_code == 200 and second.json()["expires_on"] == "2026-02-28"
+    third = _renew(client, right["id"], "LEAP-PAY-003", years=2)
+    assert third.status_code == 200 and third.json()["expires_on"] == "2028-02-28"
+    # 直接按 4 的倍数跨闰年：闰日对日仍为 2 月 29 日
+    direct = _make_right(client, "A-02-030", "2024-02-29")
+    response = _renew(client, direct["id"], "LEAP-PAY-004", years=4)
+    assert response.status_code == 200 and response.json()["expires_on"] == "2028-02-29"
+    detail = client.get(f"/api/mortuary/burial-rights/{right['id']}").json()
+    assert [r["new_expires_on"] for r in detail["renewals"]] == ["2025-02-28", "2026-02-28", "2028-02-28"]
+    assert detail["version"] == 4
+
+
+def test_month_end_and_multi_year_renewal(client):
+    jan31 = _make_right(client, "A-03-031", "2026-01-31")
+    response = _renew(client, jan31["id"], "MONTHEND-PAY-001")
+    assert response.status_code == 200 and response.json()["expires_on"] == "2027-01-31"
+    long_term = _make_right(client, "A-04-001", "2024-12-31")
+    response = _renew(client, long_term["id"], "LONG-PAY-001", years=20)
+    assert response.status_code == 200 and response.json()["expires_on"] == "2044-12-31"
+    assert response.json()["latest_renewal"]["years"] == 20
+
+
+def test_duplicate_payment_reference_replays_single_renewal(client):
+    right = _make_right(client, "A-05-001", "2026-03-15")
+    payload = {"years": 3, "handled_by": "cemetery-clerk", "payment_reference": "DUP-PAY-001"}
+    first = client.post(f"/api/mortuary/burial-rights/{right['id']}/renew", json=payload)
+    assert first.status_code == 200
+    assert first.json()["expires_on"] == "2029-03-15" and first.json()["replayed"] is False
+    # 柜台重复提交同一支付凭证：只形成一次续期
+    second = client.post(f"/api/mortuary/burial-rights/{right['id']}/renew", json=payload)
+    assert second.status_code == 200
+    assert second.json()["replayed"] is True
+    assert second.json()["expires_on"] == "2029-03-15"
+    assert second.json()["version"] == 2
+    assert second.json()["latest_renewal"]["id"] == first.json()["latest_renewal"]["id"]
+    detail = client.get(f"/api/mortuary/burial-rights/{right['id']}").json()
+    assert len(detail["renewals"]) == 1
+
+
+def test_replay_succeeds_even_after_right_suspended(client):
+    from app.database import get_connection
+    right = _make_right(client, "A-06-001", "2026-04-10")
+    first = _renew(client, right["id"], "REPLAY-PAY-001", years=2)
+    assert first.status_code == 200
+    get_connection().execute("UPDATE burial_rights SET status='suspended' WHERE id=?", (right["id"],))
+    # 已暂停不影响同一凭证的结果重放，也不会再次续期
+    second = _renew(client, right["id"], "REPLAY-PAY-001", years=2)
+    assert second.status_code == 200 and second.json()["replayed"] is True
+    assert second.json()["expires_on"] == "2028-04-10"
+    assert len(second.json()["renewals"]) == 1
+
+
+def test_payment_reference_bound_to_other_right_conflicts(client):
+    first = _make_right(client, "A-07-001", "2026-05-01")
+    other = _make_right(client, "A-07-002", "2026-05-01")
+    assert _renew(client, first["id"], "SHARED-PAY-001").status_code == 200
+    response = _renew(client, other["id"], "SHARED-PAY-001")
+    assert response.status_code == 409
+    body = response.json()["error"]
+    assert body["context"]["payment_reference"] == "SHARED-PAY-001"
+    # 被拒的一方没有留下任何续期记录，版本也不变
+    detail = client.get(f"/api/mortuary/burial-rights/{other['id']}").json()
+    assert detail["renewals"] == [] and detail["version"] == 1
+
+
+def test_closed_or_suspended_right_cannot_renew_and_leaves_no_history(client):
+    from app.database import get_connection
+    for plot, status in (("A-08-001", "closed"), ("A-08-002", "suspended")):
+        right = _make_right(client, plot, "2026-06-01")
+        get_connection().execute("UPDATE burial_rights SET status=? WHERE id=?", (status, right["id"]))
+        response = _renew(client, right["id"], f"BLOCKED-PAY-{plot}")
+        assert response.status_code == 409
+        assert response.json()["error"]["context"]["status"] == status
+        detail = client.get(f"/api/mortuary/burial-rights/{right['id']}").json()
+        assert detail["status"] == status
+        assert detail["expires_on"] == "2026-06-01"
+        assert detail["version"] == 1 and detail["renewals"] == []
+
+
+def test_expired_right_renewal_reactivates_with_full_history(client):
+    right = _make_right(client, "A-09-001", "2024-02-29")
+    from app.database import get_connection
+    get_connection().execute("UPDATE burial_rights SET status='expired' WHERE id=?", (right["id"],))
+    response = _renew(client, right["id"], "EXPIRED-PAY-001", years=4)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "active" and body["expires_on"] == "2028-02-29"
+    record = body["latest_renewal"]
+    assert record["previous_expires_on"] == "2024-02-29"
+    assert record["handled_by"] == "cemetery-clerk"
+    assert record["payment_reference"] == "EXPIRED-PAY-001"
+    assert (record["previous_version"], record["new_version"]) == (1, 2)
+
 
 
 def test_invalid_seal_rejects_transfer(client):

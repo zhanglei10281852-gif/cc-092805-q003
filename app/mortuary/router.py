@@ -53,6 +53,10 @@ def confirm_order(order_id: int, actor: str = Query(min_length=2, max_length=80)
 def create_right(payload: BurialRightCreate, actor: str = Query(min_length=2, max_length=80)) -> dict:
     return MortuaryService().create_right(payload.model_dump(), actor)
 
+@router.get("/burial-rights/{right_id}")
+def get_right(right_id: int) -> dict:
+    return MortuaryService().get_right(right_id)
+
 @router.post("/burial-rights/{right_id}/renew")
 def renew_right(right_id: int, payload: BurialRightRenew) -> dict:
     return MortuaryService().renew_right(right_id, payload.model_dump())
