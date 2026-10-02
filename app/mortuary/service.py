@@ -10,6 +10,38 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
 from app.mortuary.repository import MortuaryRepository
 
+# 到期日按年顺延的调整标记：目标年为平年时 2 月 29 日落到 2 月 28 日。
+LEAP_DAY_CLAMPED_TO_MONTH_END = "leap_day_clamped_to_month_end"
+
+# 仅“生效中”和“已到期”的权属可以续期；已暂停、已关闭的权属仍受状态限制。
+RENEWABLE_RIGHT_STATUSES = frozenset({"active", "expired"})
+
+# 权属状态机：closed 为终态；expired 只能经续期回到 active。
+RIGHT_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
+    "active": frozenset({"suspended", "closed"}),
+    "expired": frozenset({"suspended", "closed"}),
+    "suspended": frozenset({"active", "closed"}),
+    "closed": frozenset(),
+}
+
+
+def shift_anniversary_years(day: date, years: int) -> tuple[date, str]:
+    """把到期日按整年顺延，返回 (新到期日, 调整标记)。
+
+    规则：以原到期日为基准一次性加上 years 年，不做逐年递推（避免闰日
+    被逐年搬移后漂移）；目标年份存在同一月日时直接对应；唯一不存在对应日
+    的情形是 2 月 29 日顺延到平年，按“到期月没有对应日则取月末日”的规则
+    调整为 2 月 28 日，并返回调整标记供留痕与解释。
+    """
+    target_year = day.year + years
+    if target_year > 9999:
+        raise ValidationError("续期后的到期年份超出可表示范围", context={"expires_on": day.isoformat(), "years": years})
+    try:
+        return day.replace(year=target_year), ""
+    except ValueError:
+        # 仅可能为 2 月 29 日顺延到平年，月末日对应为 2 月 28 日。
+        return date(target_year, 2, 28), LEAP_DAY_CLAMPED_TO_MONTH_END
+
 
 class MortuaryService:
     def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None) -> None:
@@ -190,6 +222,14 @@ class MortuaryService:
             repo.event("burial_right", right["id"], "right.created", actor, {"plot_code": right["plot_code"], "expires_on": right["expires_on"]}, now)
             return right
 
+    def get_right(self, right_id: int) -> dict[str, Any]:
+        right = self.repository.right(right_id)
+        if right is None:
+            raise NotFoundError("墓位权属不存在")
+        right["renewals"] = self.repository.renewals(right_id)
+        right["timeline"] = self.repository.timeline("burial_right", right_id)
+        return right
+
     def renew_right(self, right_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         now = self.now()
         with transaction(immediate=True) as connection:
@@ -197,17 +237,49 @@ class MortuaryService:
             right = repo.right(right_id)
             if right is None:
                 raise NotFoundError("墓位权属不存在")
-            if right["status"] not in {"active", "expired"}:
-                raise ConflictError("当前权属状态不能续期")
-            duplicate = connection.execute("SELECT 1 FROM burial_right_renewals WHERE payment_reference=?", (payload["payment_reference"],)).fetchone()
-            if duplicate:
-                return repo.right(right_id) or {}
+            recorded = repo.renewal_by_payment(payload["payment_reference"])
+            if recorded:
+                if recorded["right_id"] != right_id or recorded["years"] != payload["years"] or recorded["handled_by"] != payload["handled_by"]:
+                    raise ConflictError("支付凭证已用于其他续期记录", context={"recorded_renewal": recorded})
+                return self._right_result(repo, right_id, last_renewal_id=int(recorded["id"]), replayed=True)
+            if right["status"] not in RENEWABLE_RIGHT_STATUSES:
+                raise ConflictError("当前权属状态不能续期", context={"status": right["status"], "renewable_statuses": sorted(RENEWABLE_RIGHT_STATUSES)})
             previous = date.fromisoformat(right["expires_on"])
-            new_expiry = previous.replace(year=previous.year + payload["years"])
+            new_expiry, adjustment = shift_anniversary_years(previous, int(payload["years"]))
+            version_before = int(right["version"])
+            version_after = version_before + 1
             connection.execute("UPDATE burial_rights SET expires_on=?,status='active',version=version+1,updated_at=? WHERE id=?", (new_expiry.isoformat(), now, right_id))
-            connection.execute("INSERT INTO burial_right_renewals(right_id,previous_expires_on,new_expires_on,years,payment_reference,handled_by,created_at) VALUES(?,?,?,?,?,?,?)", (right_id, previous.isoformat(), new_expiry.isoformat(), payload["years"], payload["payment_reference"], payload["handled_by"], now))
-            repo.event("burial_right", right_id, "right.renewed", payload["handled_by"], {"previous_expires_on": previous.isoformat(), "new_expires_on": new_expiry.isoformat(), "payment_reference": payload["payment_reference"]}, now)
+            cursor = connection.execute("INSERT INTO burial_right_renewals(right_id,previous_expires_on,new_expires_on,years,payment_reference,handled_by,version_before,version_after,date_adjustment,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (right_id, previous.isoformat(), new_expiry.isoformat(), payload["years"], payload["payment_reference"], payload["handled_by"], version_before, version_after, adjustment, now))
+            renewal_id = int(cursor.lastrowid)
+            repo.event("burial_right", right_id, "right.renewed", payload["handled_by"], {"renewal_id": renewal_id, "previous_expires_on": previous.isoformat(), "new_expires_on": new_expiry.isoformat(), "years": payload["years"], "payment_reference": payload["payment_reference"], "version_before": version_before, "version_after": version_after, "date_adjustment": adjustment}, now)
+            return self._right_result(repo, right_id, last_renewal_id=renewal_id, replayed=False)
+
+    def change_right_status(self, right_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self.now()
+        with transaction(immediate=True) as connection:
+            repo = MortuaryRepository(connection)
+            right = repo.right(right_id)
+            if right is None:
+                raise NotFoundError("墓位权属不存在")
+            current = right["status"]
+            target = payload["status"]
+            if target == current:
+                return right
+            allowed = RIGHT_STATUS_TRANSITIONS.get(current, frozenset())
+            if target not in allowed:
+                raise ConflictError("当前权属状态不能变更为目标状态", context={"current_status": current, "target_status": target, "allowed_targets": sorted(allowed)})
+            version_before = int(right["version"])
+            connection.execute("UPDATE burial_rights SET status=?,version=version+1,updated_at=? WHERE id=?", (target, now, right_id))
+            repo.event("burial_right", right_id, "right.status_changed", payload["handled_by"], {"previous_status": current, "new_status": target, "reason": payload["reason"], "version_before": version_before, "version_after": version_before + 1}, now)
             return repo.right(right_id) or {}
+
+    def _right_result(self, repo: MortuaryRepository, right_id: int, *, last_renewal_id: int, replayed: bool) -> dict[str, Any]:
+        right = repo.right(right_id) or {}
+        renewals = repo.renewals(right_id)
+        right["renewals"] = renewals
+        right["last_renewal"] = next((item for item in renewals if item["id"] == last_renewal_id), None)
+        right["replayed"] = replayed
+        return right
 
     def create_invoice(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = self.now()

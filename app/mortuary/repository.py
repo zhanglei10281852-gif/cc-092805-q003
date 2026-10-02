@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS burial_rights (
 CREATE TABLE IF NOT EXISTS burial_right_renewals (
  id INTEGER PRIMARY KEY AUTOINCREMENT, right_id INTEGER NOT NULL REFERENCES burial_rights(id),
  previous_expires_on TEXT NOT NULL, new_expires_on TEXT NOT NULL, years INTEGER NOT NULL,
- payment_reference TEXT NOT NULL UNIQUE, handled_by TEXT NOT NULL, created_at TEXT NOT NULL
+ payment_reference TEXT NOT NULL UNIQUE, handled_by TEXT NOT NULL,
+ version_before INTEGER, version_after INTEGER, date_adjustment TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS invoices (
  id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER NOT NULL REFERENCES mortuary_cases(id),
@@ -74,6 +76,13 @@ CREATE TABLE IF NOT EXISTS mortuary_events (
 CREATE INDEX IF NOT EXISTS idx_mortuary_event ON mortuary_events(aggregate_type,aggregate_id,id);
 '''
 
+# 既有数据库的续期表结构补齐：列不存在时才执行 ALTER，保证可重复启动。
+RENEWAL_MIGRATIONS = (
+    ("version_before", "ALTER TABLE burial_right_renewals ADD COLUMN version_before INTEGER"),
+    ("version_after", "ALTER TABLE burial_right_renewals ADD COLUMN version_after INTEGER"),
+    ("date_adjustment", "ALTER TABLE burial_right_renewals ADD COLUMN date_adjustment TEXT NOT NULL DEFAULT ''"),
+)
+
 
 class MortuaryRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
@@ -81,6 +90,10 @@ class MortuaryRepository:
 
     def ensure_schema(self) -> None:
         self.connection.executescript(SCHEMA)
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(burial_right_renewals)")}
+        for name, ddl in RENEWAL_MIGRATIONS:
+            if name not in columns:
+                self.connection.execute(ddl)
 
     @staticmethod
     def one(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -125,6 +138,13 @@ class MortuaryRepository:
 
     def right_plot(self, plot_code: str) -> dict[str, Any] | None:
         return self.one(self.connection.execute("SELECT * FROM burial_rights WHERE plot_code=?", (plot_code,)).fetchone())
+
+    def renewal_by_payment(self, payment_reference: str) -> dict[str, Any] | None:
+        return self.one(self.connection.execute("SELECT * FROM burial_right_renewals WHERE payment_reference=?", (payment_reference,)).fetchone())
+
+    def renewals(self, right_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM burial_right_renewals WHERE right_id=? ORDER BY id", (right_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def invoice(self, invoice_id: int) -> dict[str, Any] | None:
         return self.one(self.connection.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone())

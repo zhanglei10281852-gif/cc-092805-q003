@@ -103,6 +103,18 @@ class BurialRightRenew(BaseModel):
     payment_reference: str = Field(min_length=4, max_length=120)
 
 
+class BurialRightStatusTarget(str, Enum):
+    active = "active"
+    suspended = "suspended"
+    closed = "closed"
+
+
+class BurialRightStatusChange(BaseModel):
+    status: BurialRightStatusTarget
+    reason: str = Field(min_length=2, max_length=500)
+    handled_by: str = Field(min_length=2, max_length=80)
+
+
 class InvoiceCreate(BaseModel):
     case_id: int = Field(gt=0)
     order_ids: list[int] = Field(min_length=1, max_length=100)

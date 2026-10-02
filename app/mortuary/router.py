@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query
 
-from app.mortuary.schemas import BurialRightCreate, BurialRightRenew, CaseCreate, CustodyAccept, CustodyTransferCreate, InvoiceCreate, PaymentCreate, ReservationCreate, ResourceCreate, ServiceOrderCreate
+from app.mortuary.schemas import BurialRightCreate, BurialRightRenew, BurialRightStatusChange, CaseCreate, CustodyAccept, CustodyTransferCreate, InvoiceCreate, PaymentCreate, ReservationCreate, ResourceCreate, ServiceOrderCreate
 from app.mortuary.service import MortuaryService
 
 router = APIRouter(prefix="/api/mortuary", tags=["mortuary"])
@@ -53,9 +53,17 @@ def confirm_order(order_id: int, actor: str = Query(min_length=2, max_length=80)
 def create_right(payload: BurialRightCreate, actor: str = Query(min_length=2, max_length=80)) -> dict:
     return MortuaryService().create_right(payload.model_dump(), actor)
 
+@router.get("/burial-rights/{right_id}")
+def get_right(right_id: int) -> dict:
+    return MortuaryService().get_right(right_id)
+
 @router.post("/burial-rights/{right_id}/renew")
 def renew_right(right_id: int, payload: BurialRightRenew) -> dict:
     return MortuaryService().renew_right(right_id, payload.model_dump())
+
+@router.post("/burial-rights/{right_id}/status")
+def change_right_status(right_id: int, payload: BurialRightStatusChange) -> dict:
+    return MortuaryService().change_right_status(right_id, payload.model_dump(mode="json"))
 
 @router.post("/invoices", status_code=201)
 def create_invoice(payload: InvoiceCreate) -> dict:
